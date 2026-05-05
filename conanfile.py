@@ -32,6 +32,7 @@ icu = f"icu{postfix}"
 gperftools = f"gperftools{postfix}"
 liburing = f"liburing{postfix}"
 llvm_core = f"llvm-core{postfix}"
+paimon_cpp = f"paimon-cpp{postfix}"
 
 
 class TorchOption:
@@ -82,6 +83,7 @@ class BoltConan(ConanFile):
         "enable_parquet": [True, False],
         "enable_orc": [True, False],
         "enable_txt": [True, False],
+        "enable_paimon": [True, False],
         # file system options
         "enable_hdfs": [True, False],
         "enable_s3": [True, False],
@@ -109,6 +111,7 @@ class BoltConan(ConanFile):
         "enable_parquet": True,
         "enable_orc": True,
         "enable_txt": True,
+        "enable_paimon": True,
         # file system options
         "enable_hdfs": True,
         "enable_s3": False,
@@ -280,6 +283,8 @@ class BoltConan(ConanFile):
         self.requires("libbacktrace/cci.20210118")
         if self.options.get_safe("spark_compatible"):
             self.requires("celeborn-cpp-client/main-20251212")
+        if self.options.get_safe("enable_paimon"):
+            self.requires("paimon-cpp/0.0.3-bolt")
         if self.options.get_safe("enable_testutil"):
             self.requires("gtest/1.17.0", force=True)
             self.requires("duckdb/0.8.1")
@@ -315,6 +320,8 @@ class BoltConan(ConanFile):
         if self.options.get_safe("enable_s3"):
             s3_opt = self.options["aws-sdk-cpp/*"]
             setattr(s3_opt, "text-to-speech", False)
+        self.options[paimon_cpp].shared = False
+        self.options[paimon_cpp].with_avro = True
 
         arrow_simd_level = "default"
         if str(self.settings.arch) in ["x86", "x86_64"]:
@@ -447,6 +454,9 @@ class BoltConan(ConanFile):
 
         tc.cache_variables["BOLT_ENABLE_TXT"] = (
             "ON" if self.options.enable_txt else "OFF"
+        )
+        tc.cache_variables["BOLT_ENABLE_PAIMON"] = (
+            "ON" if self.options.enable_paimon else "OFF"
         )
         if self.options.get_safe("enable_jit"):
             tc.cache_variables["ENABLE_BOLT_JIT"] = "ON"
@@ -653,6 +663,15 @@ class BoltConan(ConanFile):
         if self.options.get_safe("spark_compatible"):
             self.cpp_info.components["bolt_engine"].requires.append(
                 "celeborn-cpp-client::celeborn-cpp-client"
+            )
+        if self.options.get_safe("enable_paimon"):
+            self.cpp_info.components["bolt_engine"].requires.extend(
+                [
+                    "paimon-cpp::core",
+                    "paimon-cpp::format_avro",
+                    "paimon-cpp::avro",
+                    "paimon-cpp::fs_local",
+                ]
             )
 
         if self.options.get_safe("enable_testutil"):
