@@ -275,9 +275,7 @@ class BoltConan(ConanFile):
         if self.settings.os in ["Linux", "FreeBSD"]:
             if self.options.get_safe("enable_perf"):
                 self.requires("gperftools/2.16")
-                self.requires("libunwind/1.8.0", override=True)
-            else:
-                self.requires("libunwind/1.8.0")
+            self.requires("libunwind/1.8.3", override=True)
         self.requires("utf8proc/2.11.0", transitive_headers=True, transitive_libs=True)
         self.requires("date/3.0.4-bolt", transitive_headers=True, transitive_libs=True)
         self.requires("libbacktrace/cci.20210118")
@@ -287,7 +285,7 @@ class BoltConan(ConanFile):
             self.requires("paimon-cpp/0.0.4-bolt")
         if self.options.get_safe("enable_testutil"):
             self.requires("gtest/1.17.0", force=True)
-            self.requires("duckdb/0.8.1")
+            self.requires("duckdb/1.1.3")
 
     def build_requirements(self):
         self.tool_requires("m4/1.4.19")
@@ -324,10 +322,13 @@ class BoltConan(ConanFile):
         self.options[paimon_cpp].with_avro = True
 
         arrow_simd_level = "default"
+        llvm_targets = None
         if str(self.settings.arch) in ["x86", "x86_64"]:
             arrow_simd_level = "avx2"
+            llvm_targets = "X86"
         elif str(self.settings.arch) in ["armv8", "arm", "armv9"]:
             arrow_simd_level = "neon"
+            llvm_targets = "AArch64"
         self.options[arrow].parquet = True
         self.options[arrow].filesystem_layer = True
         self.options[arrow].simd_level = arrow_simd_level
@@ -360,6 +361,9 @@ class BoltConan(ConanFile):
             self.options[llvm_core].with_zstd = False
             self.options[llvm_core].with_ffi = False
             self.options[llvm_core].with_clang = True
+            if llvm_targets is None:
+                raise RuntimeError("Unsupported target for JIT feature")
+            self.options[llvm_core].targets = llvm_targets
 
         if self.options.get_safe("enable_hdfs") and self.options.get_safe(
             "use_arrow_hdfs"
