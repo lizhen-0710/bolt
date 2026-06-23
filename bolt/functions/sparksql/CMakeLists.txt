@@ -52,6 +52,7 @@ bolt_add_library(
   # RegisterCompare.cpp
   SequenceFunction.cpp
   SplitFunctions.cpp
+  StringSplitSQL.cpp
   String.cpp
   UnscaledValueFunction.cpp
   VariantEncoding.cpp
