@@ -46,6 +46,9 @@ arrow::Status BoltShuffleWriterV2::split(
   bytedance::bolt::NanosecondTimer splitTimer(&totalSplitTime_);
   updateInputMetrics(rv);
   BOLT_DCHECK(options_.partitioning != Partitioning::kSingle);
+  // Floor the budget so a tiny memLimit (e.g. an upstream operator holding most
+  // of the memory) doesn't fragment into small, poorly-compressed splits.
+  memLimit = std::max(memLimit, kMinMemLimit);
   if (bytedance::bolt::RowVector::isComposite(rv)) {
     if (vectorLayout_ == RowVectorLayout::kColumnar) {
       RETURN_NOT_OK(tryEvict());
