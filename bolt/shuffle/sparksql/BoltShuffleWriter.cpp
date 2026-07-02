@@ -2416,16 +2416,13 @@ arrow::Status BoltShuffleWriter::tryEvictComposite() {
   return arrow::Status::OK();
 }
 
-arrow::MemoryPool* BoltShuffleWriter::getSpillArrowPool(
+std::shared_ptr<arrow::MemoryPool> BoltShuffleWriter::getSpillArrowPool(
     arrow::MemoryPool* pool) {
   if (dynamic_cast<BoltArrowMemoryPool*>(pool) != nullptr) {
-    // If the pool is BoltArrowMemoryPool, shuffle is offload as bolt operator
-    static std::shared_ptr<arrow::MemoryPool> spillPool =
-        std::make_shared<BoltArrowMemoryPool>(
-            bytedance::bolt::memory::spillMemoryPool());
-    return spillPool.get();
+    return std::make_shared<BoltArrowMemoryPool>(
+        bytedance::bolt::memory::spillMemoryPool());
   } else {
-    return pool;
+    return std::shared_ptr<arrow::MemoryPool>(pool, [](arrow::MemoryPool*) {});
   }
 }
 
