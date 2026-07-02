@@ -559,6 +559,36 @@ TEST_F(JsonFucntionTest, jsonInfiniteLoop) {
   }
 }
 
+TEST_F(JsonFucntionTest, malformedJsonDoesNotReturnPartialResult) {
+  queryCtx_->testingOverrideConfigUnsafe(
+      {{core::QueryConfig::kThrowExceptionWhenEncounterBadJson, "false"},
+       {core::QueryConfig::kUseSonicJson, "true"},
+       {core::QueryConfig::kUseDOMParserInGetJsonObject, "false"},
+       {core::QueryConfig::kGetJsonObjectEscapeEmoji, "true"}});
+
+  const std::string malformedJson =
+      R"({"key":"ID_A","labels":"TEXT_A","valuesSize":1)";
+  EXPECT_EQ(testGetJsonObjectOnce(malformedJson, "$.key"), std::nullopt);
+  EXPECT_EQ(testGetJsonObjectOnce(malformedJson, "$.labels"), std::nullopt);
+
+  const auto validJson = malformedJson + "}";
+  EXPECT_EQ(testGetJsonObjectOnce(validJson, "$.key"), "ID_A");
+  EXPECT_EQ(testGetJsonObjectOnce(validJson, "$.labels"), "TEXT_A");
+
+  const std::string malformedBooleanJson =
+      R"({"mode":"nested","is_target_flag":true,"ts":1782069831736)";
+  EXPECT_EQ(
+      testGetJsonObjectOnce(malformedBooleanJson, "$.is_target_flag"),
+      std::nullopt);
+  EXPECT_EQ(
+      testGetJsonObjectOnce(malformedBooleanJson + "}", "$.is_target_flag"),
+      "true");
+
+  EXPECT_EQ(testGetJsonObjectOnce(R"({"a":"he"llo"})", "$.a"), std::nullopt);
+  EXPECT_EQ(
+      testGetJsonObjectOnce(R"({"a":"ok","b":"he"llo"})", "$.a"), std::nullopt);
+}
+
 } // namespace
 
 } // namespace bytedance::bolt::functions::sparksql::test
