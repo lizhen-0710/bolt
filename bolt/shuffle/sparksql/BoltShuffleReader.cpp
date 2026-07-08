@@ -389,6 +389,7 @@ std::unique_ptr<InMemoryPayload> BoltColumnarBatchDeserializer::drainSaved() {
       bufferSizes[i] += payload->bufferSizeAt(i);
     }
   }
+  NanosecondTimer timer(&mergeTime_);
   std::vector<std::shared_ptr<arrow::Buffer>> arrowBuffers;
   for (int i = 0; i < numBuffers; ++i) {
     auto buffer = arrow::AllocateResizableBuffer(bufferSizes[i], memoryPool_);
@@ -430,6 +431,7 @@ BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
     bool hasComplexType,
     uint64_t& deserializeTime,
     uint64_t& decompressTime,
+    uint64_t& mergeTime,
     bool isRowFormat,
     AdaptiveParallelZstdCodec* zstdCodec,
     RowBufferPool* rowBufferPool,
@@ -445,6 +447,7 @@ BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
       hasComplexType_(hasComplexType),
       deserializeTime_(deserializeTime),
       decompressTime_(decompressTime),
+      mergeTime_(mergeTime),
       isRowFormat_(isRowFormat),
       zstdCodec_(zstdCodec),
       rowBufferPool_(rowBufferPool),
@@ -782,6 +785,7 @@ BoltColumnarBatchDeserializerFactory::createDeserializer(
       hasComplexType_,
       deserializeTime_,
       decompressTime_,
+      mergeTime_,
       isRowBased,
       zstdCodec_.get(),
       rowBufferPool_.get(),
@@ -798,6 +802,10 @@ int64_t BoltColumnarBatchDeserializerFactory::getDecompressTime() {
 
 int64_t BoltColumnarBatchDeserializerFactory::getDeserializeTime() {
   return deserializeTime_;
+}
+
+int64_t BoltColumnarBatchDeserializerFactory::getMergeTime() {
+  return mergeTime_;
 }
 
 void BoltColumnarBatchDeserializerFactory::initFromSchema() {
