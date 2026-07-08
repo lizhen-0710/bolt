@@ -40,6 +40,7 @@
 #include "bolt/serializers/PrestoSerializer.h"
 #include "bolt/shuffle/sparksql/BoltArrowMemoryPool.h"
 #include "bolt/shuffle/sparksql/Payload.h"
+#include "bolt/shuffle/sparksql/ReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/Utils.h"
 #include "bolt/shuffle/sparksql/compression/Codec.h"
 #include "bolt/shuffle/sparksql/compression/Compression.h"
@@ -422,6 +423,7 @@ BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
     const bytedance::bolt::RowTypePtr& rowType,
     int32_t batchSize,
     int32_t shuffleBatchByteSize,
+    int32_t shuffleBufferSize,
     arrow::MemoryPool* memoryPool,
     bytedance::bolt::memory::MemoryPool* boltPool,
     std::vector<bool>* isValidityBuffer,
@@ -448,7 +450,7 @@ BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
       rowBufferPool_(rowBufferPool),
       row2ColConverter_(row2ColConverter) {
   auto result = arrow::io::BufferedInputStream::Create(
-      shuffleBatchByteSize, memoryPool, std::move(in));
+      shuffleBufferSize, memoryPool, std::move(in));
   BOLT_CHECK(
       result.ok(),
       "Failed to create BufferedInputStream: " + result.status().message());
@@ -773,6 +775,7 @@ BoltColumnarBatchDeserializerFactory::createDeserializer(
       rowType_,
       batchSize_,
       shuffleBatchByteSize_,
+      shuffleBufferSize_,
       memoryPool_,
       boltPool_,
       &isValidityBuffer_,
@@ -867,6 +870,7 @@ BoltShuffleReader::BoltShuffleReader(
   factory_->setNumPartitions(options.numPartitions);
   factory_->setShuffleWriterType(options.forceShuffleWriterType);
   factory_->setpartitioningShortName(options.partitionShortName);
+  factory_->setShuffleBufferSize(options.shuffleBufferSize);
 }
 
 } // namespace bytedance::bolt::shuffle::sparksql
