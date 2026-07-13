@@ -745,6 +745,7 @@ class BoltConan(ConanFile):
                     0xD49: "neoverse-n2",  # AWS Graviton3
                     0xD40: "neoverse-v1",  # Neoverse V1
                     0xD4F: "neoverse-v2",  # AWS Graviton4, NVIDIA Grace
+                    0xD06: "neoverse-n2",
                 }
 
                 if part_num in cpu_flags_map:
@@ -756,6 +757,11 @@ class BoltConan(ConanFile):
                         mcpu_flag += "+crypto+sha3+sm4+sve2-aes+sve2-sha3+sve2-sm4"
                         self.output.info(
                             f"Detected NVIDIA Grace CPU, using {mcpu_flag}"
+                        )
+                    elif part_num == 0xD06 and implementer == 0x48:
+                        mcpu_flag += " -march=armv9-a+sve2-bitperm -msve-vector-bits=256 -DSVE_BITS=256"
+                        self.output.info(
+                            f"Detected ARM {cpu_name} with extra features, using {mcpu_flag}"
                         )
                     else:
                         self.output.info(f"Detected ARM {cpu_name}, using {mcpu_flag}")
