@@ -46,9 +46,6 @@ arrow::Status BoltShuffleWriterV2::split(
   bytedance::bolt::NanosecondTimer splitTimer(&totalSplitTime_);
   updateInputMetrics(rv);
   BOLT_DCHECK(options_.partitioning != Partitioning::kSingle);
-  // Floor the budget so a tiny memLimit (e.g. an upstream operator holding most
-  // of the memory) doesn't fragment into small, poorly-compressed splits.
-  memLimit = std::max(memLimit, kMinMemLimit);
   if (bytedance::bolt::RowVector::isComposite(rv)) {
     if (vectorLayout_ == RowVectorLayout::kColumnar) {
       RETURN_NOT_OK(tryEvict());
@@ -71,7 +68,7 @@ arrow::Status BoltShuffleWriterV2::split(
     // computed during flatten for accurate string size estimation.
     auto flatSize = rv->estimateFlatSize();
     // try evict before split if current batch size is larger than memLimit
-    if (flatSize > memLimit) {
+    if (flatSize > memLimit && hasEnoughMemoryUsageToSpill()) {
       requestSpill_ = true;
     }
     RETURN_NOT_OK(tryEvict(memLimit));
@@ -1399,6 +1396,10 @@ arrow::Status BoltShuffleWriterV2::reclaimFixedSize(
       splitState_ == SplitState::kStop ||
       (vectorLayout_ == RowVectorLayout::kComposite &&
        !isCompositeInitialized_)) {
+    *actual = 0;
+    return arrow::Status::OK();
+  }
+  if (!hasEnoughMemoryUsageToSpill()) {
     *actual = 0;
     return arrow::Status::OK();
   }

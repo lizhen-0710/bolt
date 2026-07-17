@@ -51,6 +51,7 @@
 #include "bolt/shuffle/sparksql/BoltShuffleWriterV2.h"
 #include "bolt/vector/arrow/Abi.h"
 #include "bolt/vector/arrow/Bridge.h"
+#include "common/memory/sparksql/ExecutionMemoryPool.h"
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -1821,6 +1822,11 @@ arrow::Status BoltShuffleWriter::reclaimFixedSize(
     }
   }
 
+  if (!hasEnoughMemoryUsageToSpill()) {
+    *actual = 0;
+    return arrow::Status::OK();
+  }
+
   EvictGuard evictGuard{evictState_};
 
   if (vectorLayout_ == RowVectorLayout::kComposite) {
@@ -2639,6 +2645,22 @@ arrow::Status BoltShuffleWriter::checkFixedColumnCopyValue(
         funcLine);
   }
   return arrow::Status::OK();
+}
+
+bool BoltShuffleWriter::hasEnoughMemoryUsageToSpill() {
+  int64_t minMemoryUsageThreshold = options_.shuffleBatchSize;
+  int64_t totalUsedMemory = boltPool_->reservedBytes();
+  if (dynamic_cast<BoltArrowMemoryPool*>(pool_) == nullptr) {
+    totalUsedMemory += pool_->bytes_allocated();
+  }
+  if (memory::sparksql::ExecutionMemoryPool::instance() != nullptr) {
+    int64_t taskAverageMemory =
+        memory::sparksql::ExecutionMemoryPool::instance()->poolSize() /
+        memory::sparksql::ExecutionMemoryPool::instance()->maxTaskNumber();
+    minMemoryUsageThreshold =
+        std::min(minMemoryUsageThreshold, taskAverageMemory / 10);
+  }
+  return totalUsedMemory > minMemoryUsageThreshold;
 }
 
 } // namespace bytedance::bolt::shuffle::sparksql
