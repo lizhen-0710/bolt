@@ -681,6 +681,11 @@ void PageReader::readWithVisitor(Visitor& visitor) {
           FOLLY_LIKELY(statis_ != nullptr) ? &statis_->decodeTimeNs : nullptr);
       callDecoder(nulls, nullsFromFastPath, visitor);
     }
+    if constexpr (std::is_same_v<
+                      typename Visitor::DataType,
+                      folly::StringPiece>) {
+      reader.flushPendingStringValues(&decompressedData_);
+    }
     const auto numValuesFromPage =
         numRowsInReader<hasFilter>(reader) - numValuesBeforePage;
     if (currentPageNumValues_ >= 0) {

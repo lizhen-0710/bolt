@@ -28,11 +28,47 @@
  * --------------------------------------------------------------------------
  */
 #include <common/base/Exceptions.h>
+#include "bolt/common/testutil/TestValue.h"
 #include "bolt/dwio/common/SelectiveColumnReaderInternal.h"
 
 namespace bytedance::bolt::dwio::common {
 
 using dwio::common::TypeWithId;
+
+namespace {
+uint64_t stringBufferPayloadForPreferredSize(
+    memory::MemoryPool& pool,
+    uint64_t minPayload,
+    uint64_t targetPayload) {
+  targetPayload = std::max(targetPayload, minPayload);
+  uint64_t bestPayload = targetPayload;
+  uint64_t bestCapacity = 0;
+  for (uint64_t lower = 8;; lower <<= 1) {
+    const uint64_t candidates[] = {lower, lower + lower / 2};
+    for (auto preferred : candidates) {
+      if (preferred <= AlignedBuffer::kPaddedSize) {
+        continue;
+      }
+      const auto payload = preferred - AlignedBuffer::kPaddedSize;
+      if (payload < minPayload || payload > targetPayload) {
+        continue;
+      }
+      const auto capacity =
+          pool.preferredSize(payload + AlignedBuffer::kPaddedSize) -
+          AlignedBuffer::kPaddedSize;
+      if (capacity <= targetPayload &&
+          (bestCapacity == 0 || capacity > bestCapacity)) {
+        bestCapacity = capacity;
+        bestPayload = payload;
+      }
+    }
+    if (lower >= targetPayload + AlignedBuffer::kPaddedSize) {
+      break;
+    }
+  }
+  return bestPayload;
+}
+} // namespace
 
 template <>
 void SelectiveColumnReader::getFlatValues<int32_t, bool>(
@@ -451,8 +487,11 @@ void SelectiveColumnReader::compactScalarValues<bool, bool>(
 
 char* SelectiveColumnReader::copyStringValue(folly::StringPiece value) {
   uint64_t size = value.size();
-  if (stringBuffers_.empty() || rawStringUsed_ + size > rawStringSize_) {
-    auto bytes = std::max(size, kStringBufferSize);
+  if (rawStringBuffer_ == nullptr || rawStringUsed_ + size > rawStringSize_) {
+    const auto bytes = stringBufferPayloadForPreferredSize(
+        memoryPool_,
+        size + simd::kPadding,
+        std::max<uint64_t>(size + simd::kPadding, kStringBufferSize));
     BufferPtr buffer = AlignedBuffer::allocate<char>(bytes, &memoryPool_);
     // Use the preferred size instead of the requested one to improve memory
     // efficiency.
@@ -470,10 +509,90 @@ char* SelectiveColumnReader::copyStringValue(folly::StringPiece value) {
   return rawStringBuffer_ + start;
 }
 
+const Buffer* SelectiveColumnReader::writableStringBuffer() const {
+  if (rawStringBuffer_ == nullptr) {
+    return nullptr;
+  }
+  for (const auto& buffer : stringBuffers_) {
+    const auto* begin = buffer->as<char>();
+    const auto* end = begin + buffer->capacity();
+    if (rawStringBuffer_ >= begin && rawStringBuffer_ < end) {
+      return buffer.get();
+    }
+  }
+  return nullptr;
+}
+
 void SelectiveColumnReader::addStringValue(folly::StringPiece value) {
-  auto copy = copyStringValue(value);
-  reinterpret_cast<StringView*>(rawValues_)[numValues_++] =
-      StringView(copy, value.size());
+  if (!deferStringCopy_) {
+    auto copy = copyStringValue(value);
+    reinterpret_cast<StringView*>(rawValues_)[numValues_++] =
+        StringView(copy, value.size());
+    return;
+  }
+  pendingStringValues_.push_back({numValues_, value});
+  pendingStringBytes_ += value.size();
+  reinterpret_cast<StringView*>(rawValues_)[numValues_++] = StringView();
+}
+
+bool SelectiveColumnReader::pendingStringsReferenceBuffer(
+    const BufferPtr& buffer) const {
+  if (!buffer) {
+    return false;
+  }
+  const auto* begin = buffer->as<char>();
+  const auto* end = begin + buffer->size();
+  for (const auto& pending : pendingStringValues_) {
+    if (pending.value.empty()) {
+      continue;
+    }
+    const auto* data = pending.value.data();
+    if (data < begin || data + pending.value.size() > end) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void SelectiveColumnReader::flushPendingStringValues(BufferPtr* pageBuffer) {
+  if (pendingStringValues_.empty()) {
+    return;
+  }
+
+  auto* rawValues = reinterpret_cast<StringView*>(rawValues_);
+  bool usePageBufferForStrings = true;
+  BOLT_TEST_ADJUST(
+      "bytedance::bolt::dwio::common::SelectiveColumnReader::usePageBufferForStrings",
+      &usePageBufferForStrings);
+  if (usePageBufferForStrings && pageBuffer != nullptr && *pageBuffer &&
+      pendingStringBytes_ > (*pageBuffer)->capacity() / 2 &&
+      pendingStringsReferenceBuffer(*pageBuffer)) {
+    for (const auto& pending : pendingStringValues_) {
+      rawValues[pending.index] =
+          StringView(pending.value.data(), pending.value.size());
+    }
+    bool alreadyReferenced = false;
+    for (const auto& buffer : stringBuffers_) {
+      if (buffer.get() == pageBuffer->get()) {
+        alreadyReferenced = true;
+        break;
+      }
+    }
+    if (!alreadyReferenced) {
+      stringBuffers_.push_back(*pageBuffer);
+    }
+    pendingStringValues_.clear();
+    pendingStringBytes_ = 0;
+    return;
+  }
+
+  for (const auto& pending : pendingStringValues_) {
+    const auto size = pending.value.size();
+    auto* copy = copyStringValue(pending.value);
+    rawValues[pending.index] = StringView(copy, size);
+  }
+  pendingStringValues_.clear();
+  pendingStringBytes_ = 0;
 }
 
 bool SelectiveColumnReader::readsNullsOnly() const {

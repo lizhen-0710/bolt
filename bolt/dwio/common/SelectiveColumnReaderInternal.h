@@ -128,6 +128,7 @@ void SelectiveColumnReader::getFlatValues(
         sizeof(TVector) * rows.size());
     return;
   }
+  flushPendingStringValues();
   if (valueSize_ == sizeof(TVector)) {
     compactScalarValues<TVector, TVector>(rows, isFinal);
   } else if (sizeof(T) >= sizeof(TVector)) {
@@ -143,6 +144,11 @@ void SelectiveColumnReader::getFlatValues(
       numValues_,
       values_,
       std::move(stringBuffers_));
+  rawStringBuffer_ = nullptr;
+  rawStringSize_ = 0;
+  rawStringUsed_ = 0;
+  pendingStringValues_.clear();
+  pendingStringBytes_ = 0;
 }
 
 template <>

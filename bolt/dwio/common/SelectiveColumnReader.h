@@ -177,6 +177,8 @@ class SelectiveColumnReader {
     rawStringBuffer_ = nullptr;
     rawStringSize_ = 0;
     rawStringUsed_ = 0;
+    pendingStringValues_.clear();
+    pendingStringBytes_ = 0;
     stringBuffers_.clear();
   }
 
@@ -295,6 +297,8 @@ class SelectiveColumnReader {
     outputRows_.resize(size);
   }
 
+  void flushPendingStringValues(BufferPtr* pageBuffer = nullptr);
+
   // Sets the result nulls to be returned in getValues(). This is used for
   // combining nulls from multiple encoding runs. nullptr means no nulls.
   void setNulls(BufferPtr resultNulls);
@@ -318,6 +322,14 @@ class SelectiveColumnReader {
 
   void incrementNumValues(vector_size_t size) {
     numValues_ += size;
+  }
+
+  void dropPendingStringValues(vector_size_t newSize) {
+    while (!pendingStringValues_.empty() &&
+           pendingStringValues_.back().index >= newSize) {
+      pendingStringBytes_ -= pendingStringValues_.back().value.size();
+      pendingStringValues_.resize(pendingStringValues_.size() - 1);
+    }
   }
 
   template <typename T>
@@ -353,7 +365,9 @@ class SelectiveColumnReader {
 
   void dropResults(vector_size_t count) {
     outputRows_.resize(outputRows_.size() - count);
-    numValues_ -= count;
+    const auto newSize = numValues_ - count;
+    dropPendingStringValues(newSize);
+    numValues_ = newSize;
   }
 
   bolt::common::ScanSpec* FOLLY_NONNULL scanSpec() const {
@@ -550,6 +564,12 @@ class SelectiveColumnReader {
   // copy.
   char* FOLLY_NONNULL copyStringValue(folly::StringPiece value);
 
+  // Returns the buffer currently used as append target for string copies.
+  const Buffer* FOLLY_NULLABLE writableStringBuffer() const;
+
+  // Returns true if all pending non-inline string values point into 'buffer'.
+  bool pendingStringsReferenceBuffer(const BufferPtr& buffer) const;
+
   virtual bool hasMutation() const {
     return false;
   }
@@ -656,7 +676,16 @@ class SelectiveColumnReader {
   raw_vector<int32_t> innerNonNullRows_;
   // Buffers backing the StringViews in 'values' when reading strings.
   std::vector<BufferPtr> stringBuffers_;
-  // Writable contents of 'stringBuffers_.back()'.
+  struct PendingStringValue {
+    vector_size_t index;
+    folly::StringPiece value;
+  };
+  raw_vector<PendingStringValue> pendingStringValues_;
+  uint64_t pendingStringBytes_ = 0;
+  bool deferStringCopy_ = false;
+  // Writable append target for copied out-of-line strings. This is not
+  // necessarily 'stringBuffers_.back()' because adopted page buffers are
+  // read-only string buffers and must not become append targets.
   char* FOLLY_NULLABLE rawStringBuffer_ = nullptr;
   // True if a vector can acquire a pin to a stream's buffer and refer
   // to that as its values.
@@ -692,13 +721,6 @@ inline void SelectiveColumnReader::addValue(const folly::StringPiece value) {
   if (size <= StringView::kInlineSize) {
     reinterpret_cast<StringView*>(rawValues_)[numValues_++] =
         StringView(value.data(), size);
-    return;
-  }
-  if (rawStringBuffer_ && rawStringUsed_ + size <= rawStringSize_) {
-    memcpy(rawStringBuffer_ + rawStringUsed_, value.data(), size);
-    reinterpret_cast<StringView*>(rawValues_)[numValues_++] =
-        StringView(rawStringBuffer_ + rawStringUsed_, size);
-    rawStringUsed_ += size;
     return;
   }
   addStringValue(value);

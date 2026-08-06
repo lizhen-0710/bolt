@@ -36,6 +36,7 @@
 #ifdef SPARK_COMPATIBLE
 #include "bolt/common/base/tests/GTestUtils.h"
 #endif
+#include "bolt/common/testutil/TestValue.h"
 #include "bolt/core/QueryCtx.h"
 #include "bolt/dwio/common/DirectBufferedInput.h"
 #include "bolt/dwio/parquet/reader/RepeatedColumnReader.h"
@@ -129,6 +130,17 @@ class ParquetReaderTest : public ParquetTestBase {
     auto reader = createReader(filePath, readerOpts);
     assertReadWithReaderAndFilters(
         std::move(reader), fileName, fileSchema, std::move(filters), expected);
+  }
+
+  void assertBatchesEqual(
+      const RowVectorPtr& expected,
+      const std::vector<RowVectorPtr>& batches) {
+    vector_size_t offset = 0;
+    for (const auto& batch : batches) {
+      assertEqualVectorPart(expected, batch, offset);
+      offset += batch->size();
+    }
+    ASSERT_EQ(offset, expected->size());
   }
 };
 
@@ -2042,6 +2054,303 @@ TEST_F(ParquetReaderTest, dcMapSimple) {
   });
 
   assertReadWithReaderAndExpected(rowType, *rowReader, expected, *leafPool_);
+}
+
+namespace {
+std::string writeCompressedParquetToMemory(
+    memory::MemoryPool* rootPool,
+    memory::MemoryPool* leafPool,
+    const RowTypePtr& rowType,
+    const std::vector<RowVectorPtr>& batches,
+    uint64_t dataPageSize) {
+  auto sink = std::make_unique<MemorySink>(
+      16 * 1024 * 1024, dwio::common::FileSink::Options{.pool = leafPool});
+  auto* sinkPtr = sink.get();
+
+  bytedance::bolt::parquet::WriterOptions writerOptions;
+  writerOptions.memoryPool = rootPool;
+  writerOptions.enableDictionary = false;
+  writerOptions.compression = bytedance::bolt::common::CompressionKind_ZSTD;
+  writerOptions.dataPageSize = dataPageSize;
+
+  auto writer = std::make_unique<bytedance::bolt::parquet::Writer>(
+      std::move(sink), writerOptions, rowType);
+  for (const auto& batch : batches) {
+    writer->write(batch);
+  }
+  writer->close();
+  return std::string(sinkPtr->data(), sinkPtr->size());
+}
+
+std::string writePlainParquetToMemory(
+    memory::MemoryPool* rootPool,
+    memory::MemoryPool* leafPool,
+    const RowTypePtr& rowType,
+    const RowVectorPtr& batch,
+    bool enableDictionary,
+    uint64_t dataPageSize) {
+  auto sink = std::make_unique<MemorySink>(
+      16 * 1024 * 1024, dwio::common::FileSink::Options{.pool = leafPool});
+  auto* sinkPtr = sink.get();
+
+  bytedance::bolt::parquet::WriterOptions writerOptions;
+  writerOptions.memoryPool = rootPool;
+  writerOptions.enableDictionary = enableDictionary;
+  writerOptions.compression = bytedance::bolt::common::CompressionKind_NONE;
+  writerOptions.dataPageSize = dataPageSize;
+
+  auto writer = std::make_unique<bytedance::bolt::parquet::Writer>(
+      std::move(sink), writerOptions, rowType);
+  writer->write(batch);
+  writer->close();
+  return std::string(sinkPtr->data(), sinkPtr->size());
+}
+
+std::vector<RowVectorPtr> readStringParquetInBatches(
+    memory::MemoryPool* pool,
+    const std::string& data,
+    const RowTypePtr& rowType,
+    vector_size_t batchSize,
+    std::unique_ptr<common::Filter> filter = nullptr) {
+  dwio::common::ReaderOptions readerOptions{pool};
+  auto file = std::make_shared<InMemoryReadFile>(data);
+  auto buffer = std::make_unique<dwio::common::BufferedInput>(file, *pool);
+  auto reader =
+      std::make_unique<ParquetReader>(std::move(buffer), readerOptions);
+
+  auto rowReaderOpts = dwio::common::RowReaderOptions();
+  rowReaderOpts.select(
+      std::make_shared<bytedance::bolt::dwio::common::ColumnSelector>(
+          rowType, rowType->names()));
+  auto scanSpec = std::make_shared<common::ScanSpec>("");
+  scanSpec->addAllChildFields(*rowType);
+  if (filter != nullptr) {
+    scanSpec->getOrCreateChild("value")->setFilter(std::move(filter));
+  }
+  rowReaderOpts.setScanSpec(scanSpec);
+  auto rowReader = reader->createRowReader(rowReaderOpts);
+
+  std::vector<RowVectorPtr> batches;
+  VectorPtr result = BaseVector::create(rowType, 0, pool);
+  while (rowReader->next(batchSize, result) > 0) {
+    batches.push_back(std::static_pointer_cast<RowVector>(result));
+    result = BaseVector::create(rowType, 0, pool);
+  }
+  return batches;
+}
+
+std::unique_ptr<common::Filter> keepPrefixFilter() {
+  return common::createBytesRange(
+      std::optional<std::string>("keep-"),
+      true /* lowerInclusive */,
+      std::optional<std::string>("keep."),
+      false /* upperInclusive */,
+      false /* nullAllowed */);
+}
+
+int32_t bufferIndexForStringView(
+    const FlatVector<StringView>& vector,
+    const StringView& view) {
+  if (view.isInline()) {
+    return -1;
+  }
+  const auto& buffers = vector.stringBuffers();
+  for (auto i = 0; i < buffers.size(); ++i) {
+    const auto* begin = buffers[i]->as<char>();
+    const auto* end = begin + buffers[i]->size();
+    if (view.data() >= begin && view.data() + view.size() <= end) {
+      return i;
+    }
+  }
+  return -1;
+}
+} // namespace
+
+TEST_F(ParquetReaderTest, deferredStringCopyFlushesAtPageBoundary) {
+  constexpr vector_size_t kRows = 24;
+  const auto rowType = ROW({"value"}, {VARCHAR()});
+  std::vector<std::string> values;
+  values.reserve(kRows);
+  for (auto i = 0; i < kRows; ++i) {
+    values.push_back(fmt::format(
+        "page-boundary-value-{}-{}", i, std::string(40, 'a' + i % 3)));
+  }
+  auto expected = makeRowVector(
+      {"value"}, {makeFlatVector<StringView>(kRows, [&](auto row) {
+        return StringView(values[row]);
+      })});
+
+  auto data = writePlainParquetToMemory(
+      rootPool_.get(),
+      leafPool_.get(),
+      rowType,
+      expected,
+      false /* enableDictionary */,
+      128 /* dataPageSize */);
+  auto batches =
+      readStringParquetInBatches(leafPool_.get(), data, rowType, kRows);
+  assertBatchesEqual(expected, batches);
+  ASSERT_FALSE(batches.empty());
+  ASSERT_EQ(batches.back()->childAt(0)->encoding(), VectorEncoding::Simple::FLAT);
+}
+
+TEST_F(ParquetReaderTest, deferredStringCopyAdoptsLargeDecompressedPage) {
+  if (!bytedance::bolt::parquet::Writer::isCodecAvailable(
+          common::CompressionKind_ZSTD)) {
+    GTEST_SKIP() << "ZSTD codec is not available";
+  }
+
+  constexpr vector_size_t kRows = 48;
+  constexpr int32_t kPayloadBytes = 64 * 1024;
+  const auto rowType = ROW({"value"}, {VARCHAR()});
+  std::vector<std::string> values;
+  values.reserve(kRows);
+  for (auto row = 0; row < kRows; ++row) {
+    std::string value;
+    value.reserve(kPayloadBytes);
+    for (auto i = 0; i < kPayloadBytes; ++i) {
+      value.push_back(static_cast<char>('a' + ((row * 131 + i) % 26)));
+    }
+    values.push_back(std::move(value));
+  }
+
+  auto expected = makeRowVector(
+      {"value"}, {makeFlatVector<StringView>(kRows, [&](auto row) {
+        return StringView(values[row]);
+      })});
+  const auto data = writeCompressedParquetToMemory(
+      rootPool_.get(), leafPool_.get(), rowType, {expected}, 4 * 1024 * 1024);
+
+  auto readOnce = [&](bool adoptPageBuffer) {
+    BOLT_TEST_VALUE_ENABLE();
+    auto readRoot = memory::memoryManager()->addRootPool(
+        adoptPageBuffer ? "adoptPageStringRead" : "copyPageStringRead");
+    auto readPool = readRoot->addLeafChild(
+        adoptPageBuffer ? "adoptPageStringRead" : "copyPageStringRead");
+
+    SCOPED_TESTVALUE_SET(
+        "bytedance::bolt::dwio::common::SelectiveColumnReader::usePageBufferForStrings",
+        std::function<void(bool*)>(
+            [&](bool* enabled) { *enabled = adoptPageBuffer; }));
+
+    auto batches =
+        readStringParquetInBatches(readPool.get(), data, rowType, kRows);
+    BOLT_CHECK_EQ(batches.size(), 1);
+    assertBatchesEqual(expected, batches);
+    auto* flat = batches[0]->childAt(0)->as<FlatVector<StringView>>();
+    BOLT_CHECK_NOT_NULL(flat);
+    uint64_t stringBufferCapacity = 0;
+    uint64_t stringBufferSize = 0;
+    for (const auto& buffer : flat->stringBuffers()) {
+      stringBufferCapacity += buffer->capacity();
+      stringBufferSize += buffer->size();
+    }
+    return std::tuple<uint64_t, uint64_t, uint64_t>{
+        readPool->peakBytes(), stringBufferCapacity, stringBufferSize};
+  };
+
+  const auto [copyPeak, copyStringCapacity, copyStringSize] =
+      readOnce(false /* adoptPageBuffer */);
+  const auto [adoptPeak, adoptStringCapacity, adoptStringSize] =
+      readOnce(true /* adoptPageBuffer */);
+
+  EXPECT_GT(copyPeak, adoptPeak);
+  EXPECT_EQ(copyStringSize, copyStringCapacity);
+  EXPECT_LT(adoptStringSize, adoptStringCapacity);
+}
+
+TEST_F(ParquetReaderTest, deferredStringCopyDoesNotAppendToAdoptedPage) {
+  if (!bytedance::bolt::parquet::Writer::isCodecAvailable(
+          common::CompressionKind_ZSTD)) {
+    GTEST_SKIP() << "ZSTD codec is not available";
+  }
+
+  constexpr vector_size_t kFirstSmallRows = 9;
+  constexpr vector_size_t kLargeRows = 48;
+  constexpr vector_size_t kLastSmallRows = 9;
+  constexpr int32_t kSmallPayloadBytes = 64;
+  constexpr int32_t kDropPayloadBytes = 4 * 1024;
+  constexpr int32_t kLargePayloadBytes = 64 * 1024;
+  const auto rowType = ROW({"value"}, {VARCHAR()});
+
+  auto makePayload = [](std::string prefix, int32_t size, uint32_t seed) {
+    std::string value = std::move(prefix);
+    value.reserve(size);
+    uint32_t state = seed;
+    while (value.size() < size) {
+      state = state * 1664525 + 1013904223;
+      value.push_back(static_cast<char>('!' + (state % 90)));
+    }
+    return value;
+  };
+
+  std::vector<std::string> values;
+  std::vector<std::string> expectedValues;
+  values.reserve(kFirstSmallRows + kLargeRows + kLastSmallRows);
+
+  auto appendSmallPage = [&](std::string_view keepName, uint32_t seedBase) {
+    values.push_back(makePayload(
+        fmt::format("keep-{}-", keepName), kSmallPayloadBytes, seedBase));
+    expectedValues.push_back(values.back());
+    for (auto row = 1; row < kFirstSmallRows; ++row) {
+      values.push_back(makePayload(
+          fmt::format("drop-{}-{}-", keepName, row),
+          kDropPayloadBytes,
+          seedBase + row));
+    }
+  };
+  appendSmallPage("first", 11);
+  for (auto row = 0; row < kLargeRows; ++row) {
+    values.push_back(makePayload(
+        fmt::format("keep-large-{}-", row), kLargePayloadBytes, 1'000 + row));
+    expectedValues.push_back(values.back());
+  }
+  appendSmallPage("last", 21);
+
+  const auto makeBatch = [&](vector_size_t begin, vector_size_t size) {
+    return makeRowVector(
+        {"value"}, {makeFlatVector<StringView>(size, [&](auto row) {
+          return StringView(values[begin + row]);
+        })});
+  };
+  auto expected = makeRowVector(
+      {"value"},
+      {makeFlatVector<StringView>(expectedValues.size(), [&](auto row) {
+        return StringView(expectedValues[row]);
+      })});
+
+  const auto data = writeCompressedParquetToMemory(
+      rootPool_.get(),
+      leafPool_.get(),
+      rowType,
+      {makeBatch(0, kFirstSmallRows),
+       makeBatch(kFirstSmallRows, kLargeRows),
+       makeBatch(kFirstSmallRows + kLargeRows, kLastSmallRows)},
+      8 * 1024);
+
+  auto batches = readStringParquetInBatches(
+      leafPool_.get(), data, rowType, values.size(), keepPrefixFilter());
+  ASSERT_EQ(batches.size(), 1);
+  assertBatchesEqual(expected, batches);
+  auto* flat = batches[0]->childAt(0)->as<FlatVector<StringView>>();
+  ASSERT_NE(flat, nullptr);
+  ASSERT_EQ(flat->size(), expectedValues.size());
+
+  const auto firstSmallBuffer =
+      bufferIndexForStringView(*flat, flat->valueAt(0));
+  const auto firstLargeBuffer =
+      bufferIndexForStringView(*flat, flat->valueAt(1));
+  const auto lastSmallBuffer =
+      bufferIndexForStringView(*flat, flat->valueAt(flat->size() - 1));
+  ASSERT_GE(firstSmallBuffer, 0);
+  ASSERT_GE(firstLargeBuffer, 0);
+  ASSERT_GE(lastSmallBuffer, 0);
+  EXPECT_EQ(firstSmallBuffer, lastSmallBuffer);
+  EXPECT_NE(firstSmallBuffer, firstLargeBuffer);
+  for (auto row = 1; row <= kLargeRows; ++row) {
+    EXPECT_NE(
+        bufferIndexForStringView(*flat, flat->valueAt(row)), firstSmallBuffer);
+  }
 }
 
 TEST_F(ParquetReaderTest, integerToVarcharSchemaMismatchCast) {

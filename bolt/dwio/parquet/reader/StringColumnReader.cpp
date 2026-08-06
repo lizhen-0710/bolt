@@ -126,6 +126,7 @@ void StringColumnReader::read(
   const bool isDense = rows.back() == rows.size() - 1;
   if (scanSpec_->keepValues()) {
     if (scanSpec_->valueHook()) {
+      deferStringCopy_ = false;
       if (isDense) {
         readHelper<common::AlwaysTrue, true>(
             &dwio::common::alwaysTrue(),
@@ -139,6 +140,7 @@ void StringColumnReader::read(
       }
       return;
     }
+    deferStringCopy_ = true;
     if (isDense) {
       processFilter<true>(
           scanSpec_->filter(), rows, dwio::common::ExtractToReader(this));
@@ -147,6 +149,7 @@ void StringColumnReader::read(
           scanSpec_->filter(), rows, dwio::common::ExtractToReader(this));
     }
   } else {
+    deferStringCopy_ = false;
     if (isDense) {
       processFilter<true>(
           scanSpec_->filter(), rows, dwio::common::DropValues());
@@ -196,6 +199,8 @@ void StringColumnReader::dedictionarize() {
     rawStringBuffer_ = nullptr;
     rawStringSize_ = 0;
     rawStringUsed_ = 0;
+    pendingStringValues_.clear();
+    pendingStringBytes_ = 0;
     auto numValues = numValues_;
     // Convert indices to values in place. Loop from end to beginning
     // so as not to overwrite integer indices with longer StringViews.
@@ -205,8 +210,15 @@ void StringColumnReader::dedictionarize() {
         continue;
       }
       auto& view = dict->valueAt(indices[i]);
-      numValues_ = i;
-      addStringValue(folly::StringPiece(view.data(), view.size()));
+      const auto size = view.size();
+      if (view.isInline()) {
+        reinterpret_cast<StringView*>(rawValues_)[i] =
+            StringView(view.data(), size);
+      } else {
+        auto* copy = copyStringValue(folly::StringPiece(view.data(), size));
+        reinterpret_cast<StringView*>(rawValues_)[i] =
+            StringView(copy, size);
+      }
     }
     numValues_ = numValues;
   }
