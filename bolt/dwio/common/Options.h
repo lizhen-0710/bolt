@@ -31,6 +31,7 @@
 #pragma once
 
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_set>
 
@@ -613,6 +614,11 @@ class RowReaderOptions {
   }
 };
 
+// Counts pending column loaders that borrow a reader. The reader owner and each
+// pending loader hold a shared reference; reader options hold a weak reference.
+// The token itself owns no reader resources.
+struct LazyLoadToken {};
+
 /**
  * Options for creating a Reader.
  */
@@ -629,6 +635,7 @@ class ReaderOptions : public io::ReaderOptions {
   bool useColumnNamesForColumnMapping_{false};
   bool useNestedColumnNamesForColumnMapping_{false};
   std::shared_ptr<folly::Executor> ioExecutor_;
+  std::weak_ptr<LazyLoadToken> lazyLoadToken_;
 
  public:
   static constexpr uint64_t kDefaultFooterEstimatedSize = 1024 * 1024; // 1MB
@@ -656,6 +663,7 @@ class ReaderOptions : public io::ReaderOptions {
     filePreloadThreshold = other.filePreloadThreshold;
     fileColumnNamesReadAsLowerCase = other.fileColumnNamesReadAsLowerCase;
     useColumnNamesForColumnMapping_ = other.useColumnNamesForColumnMapping_;
+    lazyLoadToken_ = other.lazyLoadToken_;
     return *this;
   }
 
@@ -669,8 +677,8 @@ class ReaderOptions : public io::ReaderOptions {
         footerEstimatedSize(other.footerEstimatedSize),
         filePreloadThreshold(other.filePreloadThreshold),
         fileColumnNamesReadAsLowerCase(other.fileColumnNamesReadAsLowerCase),
-        useColumnNamesForColumnMapping_(other.useColumnNamesForColumnMapping_) {
-  }
+        useColumnNamesForColumnMapping_(other.useColumnNamesForColumnMapping_),
+        lazyLoadToken_(other.lazyLoadToken_) {}
 
   /**
    * Set the format of the file, such as "rc" or "dwrf".  The
@@ -738,6 +746,14 @@ class ReaderOptions : public io::ReaderOptions {
   ReaderOptions& setUseNestedColumnNamesForColumnMapping(bool flag) {
     useNestedColumnNamesForColumnMapping_ = flag;
     return *this;
+  }
+
+  void setLazyLoadToken(const std::shared_ptr<LazyLoadToken>& token) {
+    lazyLoadToken_ = token;
+  }
+
+  const std::weak_ptr<LazyLoadToken>& lazyLoadToken() const {
+    return lazyLoadToken_;
   }
 
   ReaderOptions& setIOExecutor(std::shared_ptr<folly::Executor> executor) {
@@ -844,6 +860,7 @@ struct WriterOptions : public ISerializable {
 
 struct ColumnReaderOptions {
   bool useColumnNamesForColumnMapping_{false};
+  std::weak_ptr<LazyLoadToken> lazyLoadToken;
 };
 
 ColumnReaderOptions makeColumnReaderOptions(const ReaderOptions& options);

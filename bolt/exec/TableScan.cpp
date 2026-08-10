@@ -254,6 +254,10 @@ RowVectorPtr TableScan::getOutput() {
           }
           lockedStats->addRuntimeStat(
               "dynamicConcurrency", RuntimeCounter(this->getConcurrency()));
+          lockedStats.unlock();
+          // The final split has already finished. Release scan reader/input
+          // buffers before downstream operators enter final output processing.
+          dataSource_->releaseFinalSplitResources();
         }
         return nullptr;
       }

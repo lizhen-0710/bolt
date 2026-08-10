@@ -445,8 +445,8 @@ void SelectiveStructColumnReaderBase::getValues(
       }
       lazyPrepared = true;
     }
-    auto loader =
-        std::make_unique<ColumnLoader>(this, children_[index], numReads_);
+    auto loader = std::make_unique<ColumnLoader>(
+        this, children_[index], numReads_, columnReaderOptions_.lazyLoadToken);
     if (childResult && childResult->isLazy() && childResult.use_count() == 1) {
       static_cast<LazyVector&>(*childResult)
           .reset(std::move(loader), rows.size());
